@@ -1,0 +1,15 @@
+[package]
+name = "wpi-token"
+version = "0.1.0"
+edition = "2021"
+description = "Wrapped Pi (wPi) Soroban token on Stellar — admin-minted 1:1 against Pi deposits relayed from Pi Network."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = { version = "=23.0.1" }
+
+[dev-dependencies]
+soroban-sdk = { version = "=23.0.1", features = ["testutils"] }

@@ -1,0 +1,15 @@
+[package]
+name = "mock-amm"
+version = "0.1.0"
+edition = "2021"
+description = "Mock AMM for testing wPi -> MockUSDC swaps in the decentralized reserve bridge."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = { version = "=23.0.1" }
+
+[dev-dependencies]
+soroban-sdk = { version = "=23.0.1", features = ["testutils"] }

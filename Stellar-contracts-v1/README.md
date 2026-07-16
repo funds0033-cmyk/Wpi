@@ -36,3 +36,21 @@ Set backend env:
 ## DEX / AMM
 
 Pool creation against Soroswap or another Stellar AMM is **not** included here; seed liquidity off-chain after deploying both tokens.
+
+## End-to-End Testnet Simulation (Smoke Test)
+
+To simulate the full deposit → mint → swap → burn lifecycle on the Stellar testnet, run the included script. This acts as the canonical "does the bridge work" smoke test across `wpi-token`, `mock-amm`, and `mock-usdc` (simulating the USDC SAC).
+
+```bash
+cd Stellar-contracts-v1
+./testnet_e2e_simulation.sh
+```
+
+**What it does:**
+1. Generates `relayer` and `alice` (user) identities and funds them via Friendbot.
+2. Deploys the tokens and AMM to the Stellar testnet.
+3. Seeds the Mock AMM with MockUSDC liquidity (as Admin).
+4. Relayer mints wPi to Alice (Deposit).
+5. Alice swaps wPi for MockUSDC (Swap).
+6. Alice burns remaining wPi for withdrawal (Burn).
+7. Verifies final balances match expectations.

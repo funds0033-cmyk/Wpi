@@ -36,14 +36,14 @@ Set backend env:
 
 ## Quickstart: full testnet flow
 
-Run the scripted walkthrough to build and exercise the complete testnet path:
+Run the scripted walkthrough to build and exercise the complete testnet path. It uses real Stellar/Soroban CLI commands against testnet, creates/funds fresh identities when needed, and prints the expected successful output after each step:
 
 ```bash
 cd Stellar-contracts-v1
 ./scripts/quickstart.sh
 ```
 
-The script creates/funds fresh Stellar testnet identities when needed, deploys `wpi-token`, `mock-usdc`, and `mock-amm`, then runs initialize → mint → approve → transfer → liquidity deposit → swap with expected output notes after each command.
+The script deploys `wpi-token`, `mock-usdc`, and `mock-amm`, then runs initialize → mint → approve → transfer → liquidity deposit → swap. Override identities, amounts, or network settings with environment variables such as `ADMIN_IDENTITY`, `RECIPIENT_IDENTITY`, `RPC_URL`, `MINT_AMOUNT`, and `SWAP_AMOUNT`.
 
 ## DEX / AMM
 

@@ -30,6 +30,7 @@ pub enum Error {
     Paused = 2,
     InsufficientBalance = 3,
     InsufficientAllowance = 4,
+    Overflow = 5,
 }
 
 #[contract]
@@ -184,9 +185,19 @@ impl WpiToken {
         if from_balance < amount {
             return Err(Error::InsufficientBalance);
         }
+        // Self-transfer is a strict no-op: skip the read/modify/write of `to`'s
+        // balance entirely so it can never double-count or spuriously overflow.
+        if from == to {
+            return Ok(());
+        }
         let to_balance = read_balance(env, to);
+        let new_to_balance = match to_balance.checked_add(amount) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
+        // from_balance >= amount was already checked above, so this cannot underflow.
         write_balance(env, from, from_balance - amount);
-        write_balance(env, to, to_balance + amount);
+        write_balance(env, to, new_to_balance);
         Ok(())
     }
 
@@ -201,8 +212,16 @@ impl WpiToken {
         }
         let to_balance = read_balance(&env, &to);
         let total = read_total_supply(&env);
-        write_balance(&env, &to, to_balance + amount);
-        write_total_supply(&env, total + amount);
+        let new_to_balance = match to_balance.checked_add(amount) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
+        let new_total = match total.checked_add(amount) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
+        write_balance(&env, &to, new_to_balance);
+        write_total_supply(&env, new_total);
         Ok(())
     }
 
@@ -220,8 +239,13 @@ impl WpiToken {
             return Err(Error::InsufficientBalance);
         }
         let total = read_total_supply(&env);
+        let new_total = match total.checked_sub(amount) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
+        // from_balance >= amount was already checked above, so this cannot underflow.
         write_balance(&env, &from, from_balance - amount);
-        write_total_supply(&env, total - amount);
+        write_total_supply(&env, new_total);
         Ok(())
     }
 
@@ -249,3 +273,5 @@ impl WpiToken {
         read_admin(&env)
     }
 }
+
+mod test;

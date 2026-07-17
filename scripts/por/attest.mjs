@@ -305,14 +305,16 @@ async function cmdAttest(unsigned) {
   mkdirSync(dirname(outPath), { recursive: true });
   writeFileSync(outPath, JSON.stringify(attestation, null, 2) + "\n");
 
-  // history snapshot
-  const histDir = join(REPO_ROOT, "attestations/history");
-  mkdirSync(histDir, { recursive: true });
-  const stamp = issued_at.replace(/[:.]/g, "-");
-  writeFileSync(
-    join(histDir, `${stamp}.json`),
-    JSON.stringify(attestation, null, 2) + "\n",
-  );
+  // history snapshot next to the output file (skip if POR_HISTORY=0)
+  if (process.env.POR_HISTORY !== "0") {
+    const histDir = join(dirname(outPath), "history");
+    mkdirSync(histDir, { recursive: true });
+    const stamp = issued_at.replace(/[:.]/g, "-");
+    writeFileSync(
+      join(histDir, `${stamp}.json`),
+      JSON.stringify(attestation, null, 2) + "\n",
+    );
+  }
 
   console.log(JSON.stringify(attestation, null, 2));
   console.log(`\nWrote ${outPath}`);

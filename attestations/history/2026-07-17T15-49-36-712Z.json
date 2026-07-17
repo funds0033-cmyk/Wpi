@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "issued_at": "2026-07-17T15:49:36.712Z",
+  "network": "testnet",
+  "wpi_contract_id": "CDUMMYWPIRESERVEATTESTATIONPLACEHOLDER000000000000000000",
+  "wpi_total_supply": "2000000000000",
+  "pi_custody_account": "pi_custody_demo_account_001",
+  "pi_custody_balance": "1000000000000",
+  "pi_balance_source": "manual",
+  "safety_margin_bps": 0,
+  "collateral_ratio": "0.50000000",
+  "status": "under_collateralized",
+  "attestor_public_key": "03254a056f4ac1c634fbae6dfeb393b468d8d05758b07260311334316eec89bb",
+  "signature": "091002a4ea10a0755859b8cf5153c3687a20f895824dd7b413d4131db0a70c3a40e8d237064f5764cf42a5c91b014ffef2b7fb805c0b3d58482d1ce28102e40b",
+  "signed_fields": [
+    "schema_version",
+    "issued_at",
+    "network",
+    "wpi_contract_id",
+    "wpi_total_supply",
+    "pi_custody_account",
+    "pi_custody_balance",
+    "pi_balance_source",
+    "safety_margin_bps"
+  ]
+}

@@ -66,10 +66,7 @@ pub fn read_allowance(env: &Env, from: &Address, spender: &Address) -> i128 {
 pub fn write_allowance(env: &Env, from: &Address, spender: &Address, amount: i128) {
     env.storage()
         .instance()
-        .set(
-            &DataKey::Allowance(from.clone(), spender.clone()),
-            &amount,
-        );
+        .set(&DataKey::Allowance(from.clone(), spender.clone()), &amount);
 }
 
 pub fn read_total_supply(env: &Env) -> i128 {
@@ -92,7 +89,12 @@ pub fn check_admin(env: &Env, admin: &Address) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn transfer_internal(env: &Env, from: &Address, to: &Address, amount: i128) -> Result<(), Error> {
+pub fn transfer_internal(
+    env: &Env,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), Error> {
     if amount < 0 {
         return Err(Error::InsufficientBalance);
     }
@@ -156,12 +158,7 @@ pub fn approve_token(
     Ok(())
 }
 
-pub fn transfer_token(
-    env: &Env,
-    from: &Address,
-    to: &Address,
-    amount: i128,
-) -> Result<(), Error> {
+pub fn transfer_token(env: &Env, from: &Address, to: &Address, amount: i128) -> Result<(), Error> {
     if is_paused(env) {
         return Err(Error::Paused);
     }
@@ -188,11 +185,7 @@ pub fn transfer_from_token(
     transfer_internal(env, from, to, amount)
 }
 
-pub fn set_admin_token(
-    env: &Env,
-    admin: &Address,
-    new_admin: &Address,
-) -> Result<(), Error> {
+pub fn set_admin_token(env: &Env, admin: &Address, new_admin: &Address) -> Result<(), Error> {
     check_admin(env, admin)?;
     write_admin(env, new_admin);
     Ok(())

@@ -1,6 +1,9 @@
 # Stellar-contracts-v1
 
-Soroban contracts deployed on **Stellar** (testnet/mainnet) for the PUSD decentralized reserve bridge:
+Soroban contracts deployed on **Stellar** (testnet/mainnet) for the PUSD decentralized reserve bridge.
+
+The relayer that mints wPi after Pi deposits are observed on Pi Network, and
+that releases Pi on wPi redemption, lives in [`../relayer`](../relayer/README.md).
 
 | Crate        | WASM artifact   | Purpose                                      |
 |-------------|-----------------|----------------------------------------------|
@@ -33,24 +36,39 @@ Set backend env:
 - `WPI_CONTRACT_ID` / `MOCK_USDC_CONTRACT_ID` — deployed contract IDs
 - `BRIDGE_STELLAR_ADMIN_SECRET_KEY` — admin key that mints wPi (keep offline in production)
 
+
+
+## Quickstart: full testnet flow
+
+Run the scripted walkthrough to build and exercise the complete testnet path. It uses real Stellar/Soroban CLI commands against testnet, creates/funds fresh identities when needed, and prints the expected successful output after each step:
+
+```bash
+cd Stellar-contracts-v1
+./scripts/quickstart.sh
+```
+
+The script deploys `wpi-token`, `mock-usdc`, and `mock-amm`, then runs initialize → mint → approve → transfer → liquidity deposit → swap. Override identities, amounts, or network settings with environment variables such as `ADMIN_IDENTITY`, `RECIPIENT_IDENTITY`, `RPC_URL`, `MINT_AMOUNT`, and `SWAP_AMOUNT`.
+
+These same values, plus the Pi Network side, configure the relayer — see
+[`../relayer/.env.example`](../relayer/.env.example).
+
+
 ## DEX / AMM
 
 Pool creation against Soroswap or another Stellar AMM is **not** included here; seed liquidity off-chain after deploying both tokens.
 
-## End-to-End Testnet Simulation (Smoke Test)
+## Proof of reserve
 
-To simulate the full deposit → mint → swap → burn lifecycle on the Stellar testnet, run the included script. This acts as the canonical "does the bridge work" smoke test across `wpi-token`, `mock-amm`, and `mock-usdc` (simulating the USDC SAC).
+wPi minting is admin/relayer-gated. Short-term **proof of reserve** is an off-chain signed attestation process (not an on-chain mint guard yet):
+
+| Resource | Location |
+|----------|----------|
+| Process & ops | [`docs/proof-of-reserve.md`](../docs/proof-of-reserve.md) |
+| On-chain oracle design | [`docs/design/on-chain-reserve-oracle.md`](../docs/design/on-chain-reserve-oracle.md) |
+| Attestor CLI | `scripts/por/attest.mjs`, `scripts/por/verify.mjs` |
+| Public feed | [`attestations/latest.json`](../attestations/latest.json) (demo until production cadence) |
 
 ```bash
-cd Stellar-contracts-v1
-./testnet_e2e_simulation.sh
+# From repo root
+node scripts/por/verify.mjs attestations/latest.json
 ```
-
-**What it does:**
-1. Generates `relayer` and `alice` (user) identities and funds them via Friendbot.
-2. Deploys the tokens and AMM to the Stellar testnet.
-3. Seeds the Mock AMM with MockUSDC liquidity (as Admin).
-4. Relayer mints wPi to Alice (Deposit).
-5. Alice swaps wPi for MockUSDC (Swap).
-6. Alice burns remaining wPi for withdrawal (Burn).
-7. Verifies final balances match expectations.

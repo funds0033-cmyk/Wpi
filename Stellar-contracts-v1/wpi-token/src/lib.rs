@@ -1,47 +1,120 @@
 #![no_std]
 
-//! Wrapped Pi (wPi) — Soroban token on **Stellar** testnet/mainnet.
-//! Mint/burn is admin-only; the cross-chain relayer (see `relayer/`) mints wPi after
-//! Pi deposits are observed on Pi Network, and watches burns to release Pi on redemption.
-//! Same interface shape as `pusd-token` for SDK compatibility.
-
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env};
-use soroban_token_common::{
-    approve_token, burn_token, initialize_token, mint_token, read_admin, read_balance,
-    read_total_supply, set_admin_token, set_paused_token, transfer_from_token, transfer_token,
-    Error,#![no_std]
-
-//! Wrapped Pi (wPi) — Soroban token on **Stellar** testnet/mainnet.
-//! Mint/burn is admin-only; the cross-chain relayer mints wPi after Pi deposits
-//! are observed on Pi Network. Same interface shape as `pusd-token` for SDK compatibility.
+//! Wrapped Pi (wPi) Soroban token.
+//!
+//! Bridge mint and burn operations are protected by independently configurable
+//! volume limits. Reaching either limit pauses the whole contract and emits a
+//! `VolumeLimitTriggered` event. The independent volume-limit admin must call
+//! `override_volume_limit` to reset the window and lift that circuit breaker.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
+    BytesN, Env, Symbol,
 };
 
 const NAME: &str = "Wrapped Pi";
 const SYMBOL: &str = "wPI";
-/// 7 decimals to match native Pi stroops convention (1e7).
 pub const DECIMALS: u32 = 7;
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    VolumeLimitAdmin,
     Paused,
+    CircuitBreaker,
     Balance(Address),
     Allowance(Address, Address),
     TotalSupply,
+    ProcessedDeposit(BytesN<32>),
+    RedemptionNonce,
+    VolumeLimitConfig,
+    VolumeGeneration,
+    VolumeBucket(u32),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeLimitConfig {
+    pub mint_limit: i128,
+    pub burn_limit: i128,
+    pub window_seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeWindow {
+    pub started_at: u64,
+    pub minted: i128,
+    pub burned: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VolumeBucket {
+    generation: u32,
+    index: u64,
+    minted: i128,
+    burned: i128,
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum Error {
     NotAdmin = 1,
     Paused = 2,
     InsufficientBalance = 3,
     InsufficientAllowance = 4,
     Overflow = 5,
+    DepositAlreadyProcessed = 6,
+    VolumeLimitsNotConfigured = 7,
+    InvalidVolumeLimit = 8,
+    CircuitBreakerActive = 9,
+    InvalidAmount = 10,
+}
+
+#[contractevent]
+pub struct DepositMinted {
+    #[topic]
+    pub pi_deposit_id: BytesN<32>,
+    pub to: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct RedemptionBurned {
+    #[topic]
+    pub nonce: u64,
+    pub from: Address,
+    pub amount: i128,
+    pub pi_destination: BytesN<32>,
+}
+
+/// Alert emitted when a successful bridge operation reaches its configured
+/// rolling-window threshold and activates the circuit breaker.
+#[contractevent]
+pub struct VolumeLimitTriggered {
+    #[topic]
+    pub operation: Symbol,
+    pub attempted_volume: i128,
+    pub limit: i128,
+    pub accepted: bool,
+    pub window_started_at: u64,
+    pub window_seconds: u64,
+}
+
+#[contractevent]
+pub struct VolumeLimitsConfigured {
+    pub mint_limit: i128,
+    pub burn_limit: i128,
+    pub window_seconds: u64,
+}
+
+#[contractevent]
+pub struct VolumeLimitOverride {
+    pub admin: Address,
+    pub reset_at: u64,
 }
 
 #[contract]
@@ -52,6 +125,37 @@ fn read_admin(env: &Env) -> Address {
         .instance()
         .get::<DataKey, Address>(&DataKey::Admin)
         .unwrap()
+}
+
+fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    if *admin != read_admin(env) {
+        return Err(Error::NotAdmin);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+fn read_volume_limit_admin(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::VolumeLimitAdmin)
+        // Backwards-compatible default for an upgraded deployment whose
+        // pre-Issue-26 state does not contain this key yet.
+        .unwrap_or_else(|| read_admin(env))
+}
+
+fn require_volume_limit_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    if *admin != read_volume_limit_admin(env) {
+        return Err(Error::NotAdmin);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+fn write_volume_limit_admin(env: &Env, admin: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::VolumeLimitAdmin, admin);
 }
 
 fn write_admin(env: &Env, admin: &Address) {
@@ -69,33 +173,43 @@ fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&DataKey::Paused, &paused);
 }
 
-fn read_balance(env: &Env, addr: &Address) -> i128 {
+fn is_circuit_breaker_active(env: &Env) -> bool {
     env.storage()
         .instance()
-        .get::<DataKey, i128>(&DataKey::Balance(addr.clone()))
+        .get::<DataKey, bool>(&DataKey::CircuitBreaker)
+        .unwrap_or(false)
+}
+
+fn set_circuit_breaker(env: &Env, active: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::CircuitBreaker, &active);
+}
+
+fn read_balance(env: &Env, address: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::Balance(address.clone()))
         .unwrap_or(0)
 }
 
-fn write_balance(env: &Env, addr: &Address, amount: i128) {
+fn write_balance(env: &Env, address: &Address, amount: i128) {
     env.storage()
         .instance()
-        .set(&DataKey::Balance(addr.clone()), &amount);
+        .set(&DataKey::Balance(address.clone()), &amount);
 }
 
-fn read_allowance(env: &Env, from: &Address, spender: &Address) -> i128 {
+fn read_allowance(env: &Env, owner: &Address, spender: &Address) -> i128 {
     env.storage()
         .instance()
-        .get::<DataKey, i128>(&DataKey::Allowance(from.clone(), spender.clone()))
+        .get::<DataKey, i128>(&DataKey::Allowance(owner.clone(), spender.clone()))
         .unwrap_or(0)
 }
 
-fn write_allowance(env: &Env, from: &Address, spender: &Address, amount: i128) {
+fn write_allowance(env: &Env, owner: &Address, spender: &Address, amount: i128) {
     env.storage()
         .instance()
-        .set(
-            &DataKey::Allowance(from.clone(), spender.clone()),
-            &amount,
-        );
+        .set(&DataKey::Allowance(owner.clone(), spender.clone()), &amount);
 }
 
 fn read_total_supply(env: &Env) -> i128 {
@@ -109,6 +223,172 @@ fn write_total_supply(env: &Env, amount: i128) {
     env.storage().instance().set(&DataKey::TotalSupply, &amount);
 }
 
+fn is_deposit_processed(env: &Env, deposit_id: &BytesN<32>) -> bool {
+    env.storage()
+        .persistent()
+        .get::<DataKey, bool>(&DataKey::ProcessedDeposit(deposit_id.clone()))
+        .unwrap_or(false)
+}
+
+fn mark_deposit_processed(env: &Env, deposit_id: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ProcessedDeposit(deposit_id.clone()), &true);
+}
+
+fn next_redemption_nonce(env: &Env) -> Result<u64, Error> {
+    let current = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::RedemptionNonce)
+        .unwrap_or(0);
+    let next = current.checked_add(1).ok_or(Error::Overflow)?;
+    env.storage()
+        .instance()
+        .set(&DataKey::RedemptionNonce, &next);
+    Ok(next)
+}
+
+fn read_volume_config(env: &Env) -> Result<VolumeLimitConfig, Error> {
+    env.storage()
+        .instance()
+        .get::<DataKey, VolumeLimitConfig>(&DataKey::VolumeLimitConfig)
+        .ok_or(Error::VolumeLimitsNotConfigured)
+}
+
+fn read_volume_generation(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get::<DataKey, u32>(&DataKey::VolumeGeneration)
+        .unwrap_or(0)
+}
+
+fn advance_volume_generation(env: &Env) -> Result<u32, Error> {
+    let next = read_volume_generation(env)
+        .checked_add(1)
+        .ok_or(Error::Overflow)?;
+    env.storage()
+        .instance()
+        .set(&DataKey::VolumeGeneration, &next);
+    Ok(next)
+}
+
+fn bucket_geometry(config: &VolumeLimitConfig) -> (u64, u32) {
+    const MAX_BUCKETS: u64 = 24;
+    let bucket_seconds = config.window_seconds.div_ceil(MAX_BUCKETS).max(1);
+    let bucket_count = config.window_seconds.div_ceil(bucket_seconds) as u32;
+    (bucket_seconds, bucket_count)
+}
+
+fn read_volume_bucket(env: &Env, generation: u32, index: u64) -> VolumeBucket {
+    // Twenty-four subdivisions plus one safety bucket prevent operations near
+    // a bucket boundary from expiring before the configured rolling window.
+    let slot = (index % 25) as u32;
+    let stored = env
+        .storage()
+        .instance()
+        .get::<DataKey, VolumeBucket>(&DataKey::VolumeBucket(slot));
+    match stored {
+        Some(bucket) if bucket.generation == generation && bucket.index == index => bucket,
+        _ => VolumeBucket {
+            generation,
+            index,
+            minted: 0,
+            burned: 0,
+        },
+    }
+}
+
+fn write_volume_bucket(env: &Env, bucket: &VolumeBucket) {
+    let slot = (bucket.index % 25) as u32;
+    env.storage()
+        .instance()
+        .set(&DataKey::VolumeBucket(slot), bucket);
+}
+
+fn read_volume_window(env: &Env, config: &VolumeLimitConfig) -> Result<VolumeWindow, Error> {
+    let now = env.ledger().timestamp();
+    let generation = read_volume_generation(env);
+    let (bucket_seconds, bucket_count) = bucket_geometry(config);
+    let current_index = now / bucket_seconds;
+    let mut minted = 0i128;
+    let mut burned = 0i128;
+    let mut offset = 0u32;
+    // Include one older boundary bucket. This is deliberately conservative:
+    // it may retain volume for at most one bucket longer, but never releases
+    // capacity before the full configured window has elapsed.
+    while offset <= bucket_count {
+        if u64::from(offset) > current_index {
+            break;
+        }
+        let bucket = read_volume_bucket(env, generation, current_index - u64::from(offset));
+        minted = minted.checked_add(bucket.minted).ok_or(Error::Overflow)?;
+        burned = burned.checked_add(bucket.burned).ok_or(Error::Overflow)?;
+        offset += 1;
+    }
+
+    Ok(VolumeWindow {
+        started_at: now.saturating_sub(config.window_seconds),
+        minted,
+        burned,
+    })
+}
+
+fn record_bridge_volume(env: &Env, operation: Symbol, amount: i128) -> Result<bool, Error> {
+    let config = read_volume_config(env)?;
+    let window = read_volume_window(env, &config)?;
+    let generation = read_volume_generation(env);
+    let (bucket_seconds, _) = bucket_geometry(&config);
+    let current_index = env.ledger().timestamp() / bucket_seconds;
+    let mut bucket = read_volume_bucket(env, generation, current_index);
+    let (new_volume, limit) = if operation == symbol_short!("mint") {
+        let volume = window.minted.checked_add(amount).ok_or(Error::Overflow)?;
+        bucket.minted = bucket.minted.checked_add(amount).ok_or(Error::Overflow)?;
+        (volume, config.mint_limit)
+    } else {
+        let volume = window.burned.checked_add(amount).ok_or(Error::Overflow)?;
+        bucket.burned = bucket.burned.checked_add(amount).ok_or(Error::Overflow)?;
+        (volume, config.burn_limit)
+    };
+
+    let accepted = new_volume <= limit;
+    if accepted {
+        write_volume_bucket(env, &bucket);
+    }
+    if new_volume >= limit {
+        set_circuit_breaker(env, true);
+        set_paused(env, true);
+        VolumeLimitTriggered {
+            operation,
+            attempted_volume: new_volume,
+            limit,
+            accepted,
+            window_started_at: window.started_at,
+            window_seconds: config.window_seconds,
+        }
+        .publish(env);
+    }
+    Ok(accepted)
+}
+
+fn transfer_internal(env: &Env, from: &Address, to: &Address, amount: i128) -> Result<(), Error> {
+    if amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    let from_balance = read_balance(env, from);
+    if from_balance < amount {
+        return Err(Error::InsufficientBalance);
+    }
+    if from == to {
+        return Ok(());
+    }
+    let to_balance = read_balance(env, to);
+    let new_to_balance = to_balance.checked_add(amount).ok_or(Error::Overflow)?;
+    write_balance(env, from, from_balance - amount);
+    write_balance(env, to, new_to_balance);
+    Ok(())
+}
+
 #[contractimpl]
 impl WpiToken {
     pub fn initialize(env: Env, admin: Address) {
@@ -117,23 +397,27 @@ impl WpiToken {
         }
         admin.require_auth();
         write_admin(&env, &admin);
+        // The deployer must rotate this role to governance/multisig before
+        // enabling bridge traffic if the bridge admin is a relayer key.
+        write_volume_limit_admin(&env, &admin);
         set_paused(&env, false);
+        set_circuit_breaker(&env, false);
     }
 
-    pub fn name(_env: Env) -> BytesN<32> {
+    pub fn name(env: Env) -> BytesN<32> {
         let mut out = [0u8; 32];
-        let b = NAME.as_bytes();
-        let n = if b.len() > 32 { 32 } else { b.len() };
-        out[..n].copy_from_slice(&b[..n]);
-        BytesN::from_array(&_env, &out)
+        let bytes = NAME.as_bytes();
+        let length = if bytes.len() > 32 { 32 } else { bytes.len() };
+        out[..length].copy_from_slice(&bytes[..length]);
+        BytesN::from_array(&env, &out)
     }
 
-    pub fn symbol(_env: Env) -> BytesN<32> {
+    pub fn symbol(env: Env) -> BytesN<32> {
         let mut out = [0u8; 32];
-        let b = SYMBOL.as_bytes();
-        let n = if b.len() > 32 { 32 } else { b.len() };
-        out[..n].copy_from_slice(&b[..n]);
-        BytesN::from_array(&_env, &out)
+        let bytes = SYMBOL.as_bytes();
+        let length = if bytes.len() > 32 { 32 } else { bytes.len() };
+        out[..length].copy_from_slice(&bytes[..length]);
+        BytesN::from_array(&env, &out)
     }
 
     pub fn decimals(_env: Env) -> u32 {
@@ -152,9 +436,83 @@ impl WpiToken {
         read_allowance(&env, &owner, &spender)
     }
 
+    pub fn admin(env: Env) -> Address {
+        read_admin(&env)
+    }
+
+    pub fn volume_limit_admin(env: Env) -> Address {
+        read_volume_limit_admin(&env)
+    }
+
+    pub fn paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
+    pub fn circuit_breaker_active(env: Env) -> bool {
+        is_circuit_breaker_active(&env)
+    }
+
+    pub fn volume_limit_config(env: Env) -> Result<VolumeLimitConfig, Error> {
+        read_volume_config(&env)
+    }
+
+    pub fn current_volume_window(env: Env) -> Result<VolumeWindow, Error> {
+        let config = read_volume_config(&env)?;
+        read_volume_window(&env, &config)
+    }
+
+    pub fn configure_volume_limits(
+        env: Env,
+        admin: Address,
+        mint_limit: i128,
+        burn_limit: i128,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        require_volume_limit_admin(&env, &admin)?;
+        if mint_limit <= 0 || burn_limit <= 0 || window_seconds == 0 {
+            return Err(Error::InvalidVolumeLimit);
+        }
+        let config = VolumeLimitConfig {
+            mint_limit,
+            burn_limit,
+            window_seconds,
+        };
+        advance_volume_generation(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::VolumeLimitConfig, &config);
+        VolumeLimitsConfigured {
+            mint_limit,
+            burn_limit,
+            window_seconds,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Admin-only override for a tripped bridge-volume circuit breaker.
+    /// Resets both rolling counters and starts a fresh window before unpausing.
+    pub fn override_volume_limit(env: Env, admin: Address) -> Result<(), Error> {
+        require_volume_limit_admin(&env, &admin)?;
+        read_volume_config(&env)?;
+        let now = env.ledger().timestamp();
+        advance_volume_generation(&env)?;
+        set_circuit_breaker(&env, false);
+        set_paused(&env, false);
+        VolumeLimitOverride {
+            admin,
+            reset_at: now,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     pub fn approve(env: Env, owner: Address, spender: Address, amount: i128) -> Result<(), Error> {
         if is_paused(&env) {
             return Err(Error::Paused);
+        }
+        if amount < 0 {
+            return Err(Error::InvalidAmount);
         }
         owner.require_auth();
         write_allowance(&env, &owner, &spender, amount);
@@ -166,7 +524,7 @@ impl WpiToken {
             return Err(Error::Paused);
         }
         from.require_auth();
-        Self::transfer_internal(&env, &from, &to, amount)
+        transfer_internal(&env, &from, &to, amount)
     }
 
     pub fn transfer_from(
@@ -179,307 +537,108 @@ impl WpiToken {
         if is_paused(&env) {
             return Err(Error::Paused);
         }
+        if amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
         spender.require_auth();
-        let current_allowance = read_allowance(&env, &from, &spender);
-        if current_allowance < amount {
+        let allowance = read_allowance(&env, &from, &spender);
+        if allowance < amount {
             return Err(Error::InsufficientAllowance);
         }
-        write_allowance(&env, &from, &spender, current_allowance - amount);
-        Self::transfer_internal(&env, &from, &to, amount)
-    }
-
-    fn transfer_internal(env: &Env, from: &Address, to: &Address, amount: i128) -> Result<(), Error> {
-        if amount < 0 {
-            return Err(Error::InsufficientBalance);
-        }
-        let from_balance = read_balance(env, from);
-        if from_balance < amount {
-            return Err(Error::InsufficientBalance);
-        }
-        if from == to {
-            return Ok(());
-        }
-        let to_balance = read_balance(env, to);
-        let new_to_balance = to_balance.checked_add(amount).ok_or(Error::Overflow)?;
-        write_balance(env, from, from_balance - amount);
-        write_balance(env, to, new_to_balance);
+        transfer_internal(&env, &from, &to, amount)?;
+        write_allowance(&env, &from, &spender, allowance - amount);
         Ok(())
     }
 
-    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) -> Result<(), Error> {
-        let current_admin = read_admin(&env);
-        if admin != current_admin {
-            return Err(Error::NotAdmin);
-        }
-        admin.require_auth();
-        if amount <= 0 {
-            return Ok(());
-        }
-        let to_balance = read_balance(&env, &to);
-        let total = read_total_supply(&env);
-        let new_to_balance = to_balance.checked_add(amount).ok_or(Error::Overflow)?;
-        let new_total = total.checked_add(amount).ok_or(Error::Overflow)?;
-        write_balance(&env, &to, new_to_balance);
-        write_total_supply(&env, new_total);
-        Ok(())
-    }
-
-    pub fn burn(env: Env, admin: Address, from: Address, amount: i128) -> Result<(), Error> {
-        let current_admin = read_admin(&env);
-        if admin != current_admin {
-            return Err(Error::NotAdmin);
-        }
-        admin.require_auth();
-        if amount <= 0 {
-            return Ok(());
-        }
-        let from_balance = read_balance(&env, &from);
-        if from_balance < amount {
-            return Err(Error::InsufficientBalance);
-        }
-        let total = read_total_supply(&env);
-        let new_total = total.checked_sub(amount).ok_or(Error::Overflow)?;
-        write_balance(&env, &from, from_balance - amount);
-        write_total_supply(&env, new_total);
-        Ok(())
-    }
-
-    pub fn set_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
-        let current_admin = read_admin(&env);
-        if admin != current_admin {
-            return Err(Error::NotAdmin);
-        }
-        admin.require_auth();
-        write_admin(&env, &new_admin);
-        Ok(())
-    }
-
-    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
-        let current_admin = read_admin(&env);
-        if admin != current_admin {
-            return Err(Error::NotAdmin);
-        }
-        admin.require_auth();
-        set_paused(&env, paused);
-        Ok(())
-    }
-
-    pub fn admin(env: Env) -> Address {
-        read_admin(&env)
-    }
-}
-};
-
-const NAME: &str = "Wrapped Pi";
-const SYMBOL: &str = "wPI";
-/// 7 decimals to match native Pi stroops convention (1e7).
-pub const DECIMALS: u32 = 7;
-
-#[contract]
-pub struct WpiToken;
-
-#[contractimpl]
-impl WpiToken {
-    pub fn initialize(env: Env, admin: Address) {
-        initialize_token(&env, &admin);
-    }
-
-    pub fn name(_env: Env) -> BytesN<32> {
-        let mut out = [0u8; 32];
-        let b = NAME.as_bytes();
-        let n = if b.len() > 32 { 32 } else { b.len() };
-        out[..n].copy_from_slice(&b[..n]);
-        BytesN::from_array(&_env, &out)
-    }
-
-    pub fn symbol(_env: Env) -> BytesN<32> {
-        let mut out = [0u8; 32];
-        let b = SYMBOL.as_bytes();
-        let n = if b.len() > 32 { 32 } else { b.len() };
-        out[..n].copy_from_slice(&b[..n]);
-        BytesN::from_array(&_env, &out)
-    }
-
-    pub fn decimals(_env: Env) -> u32 {
-        DECIMALS
-    }
-
-    pub fn total_supply(env: Env) -> i128 {
-        read_total_supply(&env)
-    }
-
-    pub fn balance(env: Env, owner: Address) -> i128 {
-        read_balance(&env, &owner)
-    }
-
-    pub fn allowance(env: Env, owner: Address, spender: Address) -> i128 {
-        soroban_token_common::read_allowance(&env, &owner, &spender)
-    }
-
-    pub fn approve(env: Env, owner: Address, spender: Address, amount: i128) -> Result<(), Error> {
-        approve_token(&env, &owner, &spender, amount)
-    }
-
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) -> Result<(), Error> {
-        transfer_token(&env, &from, &to, amount)
-    }
-
-    pub fn transfer_from(
-        env: Env,
-        spender: Address,
-        from: Address,
-        to: Address,
-        amount: i128,
-    ) -> Result<(), Error> {
+    /// Administrative mint. It uses the same bridge-wide mint counter as
+    /// `mint_from_deposit`, so no privileged mint path bypasses the cap.
+    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) -> Result<bool, Error> {
+        require_admin(&env, &admin)?;
         if is_paused(&env) {
             return Err(Error::Paused);
         }
-        spender.require_auth();
-        let current_allowance = read_allowance(&env, &from, &spender);
-        if current_allowance < amount {
-            return Err(Error::InsufficientAllowance);
-        }
-        write_allowance(&env, &from, &spender, current_allowance - amount);
-        Self::transfer_internal(&env, &from, &to, amount)
-    }
-
-    fn transfer_internal(
-        env: &Env,
-        from: &Address,
-        to: &Address,
-        amount: i128,
-    ) -> Result<(), Error> {
-        if amount < 0 {
-            return Err(Error::InsufficientBalance);
-        }
-        let from_balance = read_balance(env, from);
-        if from_balance < amount {
-            return Err(Error::InsufficientBalance);
-        }
-        // Self-transfer is a strict no-op: skip the read/modify/write of `to`'s
-        // balance entirely so it can never double-count or spuriously overflow.
-        if from == to {
-            return Ok(());
-        }
-        let to_balance = read_balance(env, to);
-        let new_to_balance = match to_balance.checked_add(amount) {
-            Some(v) => v,
-            None => return Err(Error::Overflow),
-        };
-        // from_balance >= amount was already checked above, so this cannot underflow.
-        write_balance(env, from, from_balance - amount);
-        write_balance(env, to, new_to_balance);
-        Ok(())
-    }
-
-    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) -> Result<(), Error> {
-        let current_admin = read_admin(&env);
-        if admin != current_admin {
-            return Err(Error::NotAdmin);
-        }
-        admin.require_auth();
         if amount <= 0 {
-            return Ok(());
+            return Err(Error::InvalidAmount);
         }
-        let to_balance = read_balance(&env, &to);
-        let total = read_total_supply(&env);
-        let new_to_balance = match to_balance.checked_add(amount) {
-            Some(v) => v,
-            None => return Err(Error::Overflow),
-        };
-        let new_total = match total.checked_add(amount) {
-            Some(v) => v,
-            None => return Err(Error::Overflow),
-        };
-        write_balance(&env, &to, new_to_balance);
-        write_total_supply(&env, new_total);
-        Ok(())
+        let balance = read_balance(&env, &to);
+        let supply = read_total_supply(&env);
+        let new_balance = balance.checked_add(amount).ok_or(Error::Overflow)?;
+        let new_supply = supply.checked_add(amount).ok_or(Error::Overflow)?;
+        if !record_bridge_volume(&env, symbol_short!("mint"), amount)? {
+            return Ok(false);
+        }
+        write_balance(&env, &to, new_balance);
+        write_total_supply(&env, new_supply);
+        Ok(true)
     }
 
-    /// Whether `pi_deposit_id` has already been minted. Lets the relayer
-    /// reconcile after a submission whose outcome was ambiguous (e.g. the
-    /// network dropped the response) without guessing from error text —
-    /// it just re-checks this before deciding whether to retry.
     pub fn is_deposit_processed(env: Env, pi_deposit_id: BytesN<32>) -> bool {
         is_deposit_processed(&env, &pi_deposit_id)
     }
 
-    /// Mints wPi against an observed Pi Network deposit. Called by the relayer
-    /// (see `relayer/`) once the deposit has cleared the required confirmation
-    /// depth on Pi Network.
-    ///
-    /// Idempotent by `pi_deposit_id`: a second call with the same id is a
-    /// cheap no-op (`Err(DepositAlreadyProcessed)`) rather than a double mint,
-    /// so the relayer can safely retry after a crash or a dropped response
-    /// without tracking submission state itself.
     pub fn mint_from_deposit(
         env: Env,
         admin: Address,
         to: Address,
         amount: i128,
         pi_deposit_id: BytesN<32>,
-    ) -> Result<(), Error> {
-        let current_admin = read_admin(&env);
-        if admin != current_admin {
-            return Err(Error::NotAdmin);
-        }
-        admin.require_auth();
+    ) -> Result<bool, Error> {
+        require_admin(&env, &admin)?;
         if is_paused(&env) {
             return Err(Error::Paused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
         }
         if is_deposit_processed(&env, &pi_deposit_id) {
             return Err(Error::DepositAlreadyProcessed);
         }
-        mark_deposit_processed(&env, &pi_deposit_id);
-        if amount > 0 {
-            let to_balance = read_balance(&env, &to);
-            let total = read_total_supply(&env);
-            write_balance(&env, &to, to_balance + amount);
-            write_total_supply(&env, total + amount);
+        let balance = read_balance(&env, &to);
+        let supply = read_total_supply(&env);
+        let new_balance = balance.checked_add(amount).ok_or(Error::Overflow)?;
+        let new_supply = supply.checked_add(amount).ok_or(Error::Overflow)?;
+
+        if !record_bridge_volume(&env, symbol_short!("mint"), amount)? {
+            return Ok(false);
         }
+        write_balance(&env, &to, new_balance);
+        write_total_supply(&env, new_supply);
+        mark_deposit_processed(&env, &pi_deposit_id);
         DepositMinted {
             pi_deposit_id,
             to,
             amount,
         }
         .publish(&env);
-        Ok(())
+        Ok(true)
     }
 
-    /// Burns wPi to request a Pi Network redemption, releasing native Pi to
-    /// `pi_destination` (the raw 32-byte Pi Network account id — Pi uses the
-    /// same StrKey/ed25519 address format as Stellar, being an SCP fork).
-    /// Emits a `redeem` event tagged with a monotonic nonce so the relayer's
-    /// redemption watcher (see `relayer/`) can enumerate burns in order and
-    /// dedupe Pi-side releases.
     pub fn burn(
         env: Env,
         admin: Address,
         from: Address,
         amount: i128,
         pi_destination: BytesN<32>,
-    ) -> Result<(), Error> {
-        let current_admin = read_admin(&env);
-        if admin != current_admin {
-            return Err(Error::NotAdmin);
+    ) -> Result<bool, Error> {
+        require_admin(&env, &admin)?;
+        if is_paused(&env) {
+            return Err(Error::Paused);
         }
-        admin.require_auth();
         if amount <= 0 {
-            return Ok(());
+            return Err(Error::InvalidAmount);
         }
-        let from_balance = read_balance(&env, &from);
-        if from_balance < amount {
+        let balance = read_balance(&env, &from);
+        if balance < amount {
             return Err(Error::InsufficientBalance);
         }
-        let total = read_total_supply(&env);
-        let new_total = match total.checked_sub(amount) {
-            Some(v) => v,
-            None => return Err(Error::Overflow),
-        };
-        // from_balance >= amount was already checked above, so this cannot underflow.
-        write_balance(&env, &from, from_balance - amount);
-        write_total_supply(&env, total - amount);
-        let nonce = next_redemption_nonce(&env);
+        let supply = read_total_supply(&env);
+        let new_supply = supply.checked_sub(amount).ok_or(Error::Overflow)?;
+        if !record_bridge_volume(&env, symbol_short!("burn"), amount)? {
+            return Ok(false);
+        }
+        let nonce = next_redemption_nonce(&env)?;
+        write_balance(&env, &from, balance - amount);
+        write_total_supply(&env, new_supply);
         RedemptionBurned {
             nonce,
             from,
@@ -487,27 +646,37 @@ impl WpiToken {
             pi_destination,
         }
         .publish(&env);
-        Ok(())
-        transfer_from_token(&env, &spender, &from, &to, amount)
-    }
-
-    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) -> Result<(), Error> {
-        mint_token(&env, &admin, &to, amount)
-    }
-
-    pub fn burn(env: Env, admin: Address, from: Address, amount: i128) -> Result<(), Error> {
-        burn_token(&env, &admin, &from, amount)
+        Ok(true)
     }
 
     pub fn set_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
-        set_admin_token(&env, &admin, &new_admin)
+        require_admin(&env, &admin)?;
+        write_admin(&env, &new_admin);
+        Ok(())
+    }
+
+    /// Rotates the independent circuit-breaker authority. Only the current
+    /// volume-limit admin can transfer this role; the mint/burn admin cannot
+    /// reclaim it after it has been handed to a multisig.
+    pub fn set_volume_limit_admin(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        require_volume_limit_admin(&env, &admin)?;
+        write_volume_limit_admin(&env, &new_admin);
+        Ok(())
     }
 
     pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
-        set_paused_token(&env, &admin, paused)
-    }
-
-    pub fn admin(env: Env) -> Address {
-        read_admin(&env)
+        require_admin(&env, &admin)?;
+        if !paused && is_circuit_breaker_active(&env) {
+            return Err(Error::CircuitBreakerActive);
+        }
+        set_paused(&env, paused);
+        Ok(())
     }
 }
+
+#[cfg(test)]
+mod test;

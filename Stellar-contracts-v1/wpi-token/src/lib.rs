@@ -765,6 +765,16 @@ impl WpiToken {
         set_paused(&env, paused);
         Ok(())
     }
+
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let current_admin = read_admin(&env);
+        if admin != current_admin {
+            return Err(Error::NotAdmin);
+        }
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -3,8 +3,7 @@
 //! Mock AMM pool for testing wPi -> MockUSDC swaps.
 //! Hardcodes a 1:1 swap rate (or configurable) for testnet simulation without complex math.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
-
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -83,5 +82,15 @@ impl MockAmm {
         let token_out_addr: Address = env.storage().instance().get(&DataKey::TokenOut).unwrap();
         let token_out = token::Client::new(&env, &token_out_addr);
         token_out.transfer(&from, env.current_contract_address(), &amount_out);
+    }
+
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != current_admin {
+            return Err(Error::NotAdmin);
+        }
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 }
